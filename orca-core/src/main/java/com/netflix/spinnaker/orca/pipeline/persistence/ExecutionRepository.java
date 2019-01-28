@@ -71,11 +71,36 @@ public interface ExecutionRepository {
   Observable<Execution> retrievePipelinesForPipelineConfigId(@Nonnull String pipelineConfigId,
                                                              @Nonnull ExecutionCriteria criteria);
 
+  /**
+   * Returns executions in the time boundary. Redis impl does not respect pageSize or offset params,
+   *  and returns all executions. Sql impl respects these params.
+   * @param executionCriteria use this param to specify:
+   *  if there are statuses, only those will be returned
+   *  if there is a sort type that will be used to sort the results
+   *  use pageSize and page to control pagination
+   */
   @Nonnull
-  Observable<Execution> retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(@Nonnull List<String> pipelineConfigIds,
-                                                                                      long buildTimeStartBoundary,
-                                                                                      long buildTimeEndBoundary,
-                                                                                      int limit);
+  List<Execution> retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    @Nonnull List<String> pipelineConfigIds,
+    long buildTimeStartBoundary,
+    long buildTimeEndBoundary,
+    ExecutionCriteria executionCriteria
+  );
+
+  /**
+   * Returns all executions in the time boundary
+   * @param executionCriteria
+   *  if there are statuses, only those will be returned
+   *  if there is a pageSize, that will be used as the page size
+   *  if there is a sort type that will be used to sort the results
+   */
+  @Nonnull
+  List<Execution> retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    @Nonnull List<String> pipelineConfigIds,
+    long buildTimeStartBoundary,
+    long buildTimeEndBoundary,
+    ExecutionCriteria executionCriteria
+  );
 
   @Deprecated // Use the non-rx interface instead
   @Nonnull
@@ -100,21 +125,22 @@ public interface ExecutionRepository {
   List<String> retrieveAllApplicationNames(@Nullable ExecutionType executionType, int minExecutions);
 
   boolean hasExecution(@Nonnull ExecutionType type, @Nonnull String id);
-  
+
   List<String> retrieveAllExecutionIds(@Nonnull ExecutionType type);
 
   final class ExecutionCriteria {
-    private int limit = 3500;
+    private int pageSize = 3500;
     private Collection<ExecutionStatus> statuses = new ArrayList<>();
     private int page;
     private Instant startTimeCutoff;
+    private ExecutionComparator sortType;
 
-    public int getLimit() {
-      return limit;
+    public int getPageSize() {
+      return pageSize;
     }
 
-    public @Nonnull ExecutionCriteria setLimit(int limit) {
-      this.limit = limit;
+    public @Nonnull ExecutionCriteria setPageSize(int pageSize) {
+      this.pageSize = pageSize;
       return this;
     }
 
@@ -126,7 +152,7 @@ public interface ExecutionRepository {
       return setStatuses(
         statuses
           .stream()
-          .map(ExecutionStatus::valueOf)
+          .map(it -> ExecutionStatus.valueOf(it.toUpperCase()))
           .collect(toList())
           .toArray(new ExecutionStatus[statuses.size()])
       );
@@ -155,36 +181,62 @@ public interface ExecutionRepository {
       return this;
     }
 
+    public ExecutionComparator getSortType() {
+      return sortType;
+    }
+
+    public ExecutionCriteria setSortType(ExecutionComparator sortType) {
+      this.sortType = sortType;
+      return this;
+    }
+
     @Override public boolean equals(Object o) {
       if (this == o) return true;
       if (o == null || getClass() != o.getClass()) return false;
       ExecutionCriteria that = (ExecutionCriteria) o;
-      return limit == that.limit &&
+      return pageSize == that.pageSize &&
         Objects.equals(statuses, that.statuses) &&
         page == that.page;
     }
 
     @Override public int hashCode() {
-      return Objects.hash(limit, statuses, page);
+      return Objects.hash(pageSize, statuses, page);
     }
   }
 
   enum ExecutionComparator implements Comparator<Execution> {
 
-    NATURAL {
+    NATURAL_ASC {
       @Override
       public int compare(Execution a, Execution b) {
         return b.getId().compareTo(a.getId());
       }
     },
 
+    NATURAL_DESC {
+      @Override
+      public int compare(Execution a, Execution b) {
+        return a.getId().compareTo(b.getId());
+      }
+    },
+
+    /**
+     * Sort executions nulls first, then by startTime descending, breaking ties by lexicographically descending IDs.
+     */
     START_TIME_OR_ID {
       @Override
       public int compare(Execution a, Execution b) {
-        Long aStartTime = Optional.ofNullable(a.getStartTime()).orElse(0L);
-        Long bStartTime = Optional.ofNullable(b.getStartTime()).orElse(0L);
+        Long aStartTime = a.getStartTime();
+        Long bStartTime = b.getStartTime();
 
-        int startCompare = aStartTime.compareTo(bStartTime);
+        if (aStartTime == null) {
+          return -1;
+        }
+        if (bStartTime == null) {
+          return 0;
+        }
+
+        int startCompare = bStartTime.compareTo(aStartTime);
         if (startCompare == 0) {
           return b.getId().compareTo(a.getId());
         }
@@ -192,7 +244,7 @@ public interface ExecutionRepository {
       }
     },
 
-    REVERSE_BUILD_TIME {
+    BUILD_TIME_DESC {
       @Override
       public int compare(Execution a, Execution b) {
         Long aBuildTime = Optional.ofNullable(a.getBuildTime()).orElse(0L);
@@ -201,6 +253,20 @@ public interface ExecutionRepository {
         int buildCompare = bBuildTime.compareTo(aBuildTime);
         if (buildCompare == 0) {
           return b.getId().compareTo(a.getId());
+        }
+        return buildCompare;
+      }
+    },
+
+    BUILD_TIME_ASC {
+      @Override
+      public int compare(Execution a, Execution b) {
+        Long aBuildTime = Optional.ofNullable(a.getBuildTime()).orElse(0L);
+        Long bBuildTime = Optional.ofNullable(b.getBuildTime()).orElse(0L);
+
+        int buildCompare = aBuildTime.compareTo(bBuildTime);
+        if (buildCompare == 0) {
+          return a.getId().compareTo(b.getId());
         }
         return buildCompare;
       }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Google, Inc.
+ * Copyright 2019 Netflix, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-package com.netflix.spinnaker.orca.pipelinetemplate.v1schema.handler.v2
+package com.netflix.spinnaker.orca.retrofit;
 
-import com.netflix.spinnaker.orca.pipelinetemplate.handler.PipelineTemplateSchemaContext
-import com.netflix.spinnaker.orca.pipelinetemplate.v1schema.model.TemplateConfiguration
-import com.netflix.spinnaker.orca.pipelinetemplate.v2schema.model.V2PipelineTemplate
+import java.util.List;
 
-data class V2PipelineTemplateContext(
-  val configuration: TemplateConfiguration,
-  val template: V2PipelineTemplate
-) : PipelineTemplateSchemaContext
+public interface RetrofitInterceptorProvider {
+  List<okhttp3.Interceptor> getInterceptors();
+  List<com.squareup.okhttp.Interceptor> getLegacyInterceptors();
+}

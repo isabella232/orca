@@ -22,10 +22,13 @@ import com.netflix.spinnaker.fiat.shared.FiatService
 import com.netflix.spinnaker.fiat.shared.FiatStatus
 import com.netflix.spinnaker.kork.web.exceptions.InvalidRequestException
 import com.netflix.spinnaker.kork.web.exceptions.ValidationException
+import com.netflix.spinnaker.orca.clouddriver.service.JobService
 import com.netflix.spinnaker.orca.extensionpoint.pipeline.PipelinePreprocessor
-import com.netflix.spinnaker.orca.igor.BuildArtifactFilter
+import com.netflix.spinnaker.orca.front50.Front50Service
+import com.netflix.spinnaker.orca.front50.PipelineModelMutator
 import com.netflix.spinnaker.orca.igor.BuildService
 import com.netflix.spinnaker.orca.pipeline.ExecutionLauncher
+import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Trigger
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionNotFoundException
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
@@ -35,11 +38,15 @@ import com.netflix.spinnaker.orca.pipelinetemplate.PipelineTemplateService
 import com.netflix.spinnaker.orca.webhook.service.WebhookService
 import com.netflix.spinnaker.security.AuthenticatedRequest
 import groovy.util.logging.Slf4j
+import javassist.NotFoundException
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestMethod
 import org.springframework.web.bind.annotation.RestController
+import retrofit.RetrofitError
+import retrofit.http.Query
 
 import javax.servlet.http.HttpServletResponse
 
@@ -69,13 +76,16 @@ class OperationsController {
   ContextParameterProcessor contextParameterProcessor
 
   @Autowired(required = false)
-  BuildArtifactFilter buildArtifactFilter
-
-  @Autowired(required = false)
   List<PipelinePreprocessor> pipelinePreprocessors
 
   @Autowired(required = false)
+  private List<PipelineModelMutator> pipelineModelMutators = new ArrayList<>();
+
+  @Autowired(required = false)
   WebhookService webhookService
+
+  @Autowired(required = false)
+  JobService jobService
 
   @Autowired(required = false)
   ArtifactResolver artifactResolver
@@ -86,45 +96,97 @@ class OperationsController {
   @Autowired(required = false)
   FiatService fiatService
 
+  @Autowired(required = false)
+  Front50Service front50Service
+
   @RequestMapping(value = "/orchestrate", method = RequestMethod.POST)
   Map<String, Object> orchestrate(@RequestBody Map pipeline, HttpServletResponse response) {
+    planOrOrchestratePipeline(pipeline)
+  }
+
+  @RequestMapping(value = "/orchestrate/{pipelineConfigId}", method = RequestMethod.POST)
+  Map<String, Object> orchestratePipelineConfig(@PathVariable String pipelineConfigId, @RequestBody Map trigger) {
+    Map pipelineConfig = buildPipelineConfig(pipelineConfigId, trigger)
+    planOrOrchestratePipeline(pipelineConfig)
+  }
+
+  @RequestMapping(value = "/plan", method = RequestMethod.POST)
+  Map<String, Object> plan(@RequestBody Map pipeline, @Query("resolveArtifacts") boolean resolveArtifacts, HttpServletResponse response) {
+    planPipeline(pipeline, resolveArtifacts)
+  }
+
+  @RequestMapping(value = "/plan/{pipelineConfigId}", method = RequestMethod.POST)
+  Map<String, Object> planPipelineConfig(@PathVariable String pipelineConfigId, @Query("resolveArtifacts") boolean resolveArtifacts, @RequestBody Map trigger) {
+    Map pipelineConfig = buildPipelineConfig(pipelineConfigId, trigger)
+    planPipeline(pipelineConfig, resolveArtifacts)
+  }
+
+  private Map buildPipelineConfig(String pipelineConfigId, Map trigger) {
+    if (front50Service == null) {
+      throw new UnsupportedOperationException("Front50 is not enabled, no way to retrieve pipeline configs. Fix this by setting front50.enabled: true")
+    }
+
+    List<Map> history = front50Service.getPipelineHistory(pipelineConfigId, 1)
+    if (history.isEmpty()) {
+      throw new NotFoundException("Pipeline config $pipelineConfigId not found")
+    }
+    Map pipelineConfig = history[0]
+    pipelineConfig.trigger = trigger
+    return pipelineConfig
+  }
+
+  private Map planOrOrchestratePipeline(Map pipeline) {
+    if (pipeline.plan) {
+      planPipeline(pipeline, false)
+    } else {
+      orchestratePipeline(pipeline)
+    }
+  }
+
+  private Map<String, Object> planPipeline(Map pipeline, boolean resolveArtifacts) {
+    log.info('Not starting pipeline (plan: true): {}', value("pipelineId", pipeline.id))
+    pipelineModelMutators.stream().filter({m -> m.supports(pipeline)}).forEach({m -> m.mutate(pipeline)})
+    return parseAndValidatePipeline(pipeline, resolveArtifacts)
+  }
+
+  private Map<String, Object> orchestratePipeline(Map pipeline) {
+    def request = objectMapper.writeValueAsString(pipeline)
+
     Exception pipelineError = null
-    boolean plan = pipeline.plan ?: false
     try {
       pipeline = parseAndValidatePipeline(pipeline)
     } catch (Exception e) {
       pipelineError = e
     }
 
-    if (plan) {
-      log.info('Not starting pipeline (plan: true): {}', value("pipelineId", pipeline.id))
-      if (pipelineError != null) {
-        throw pipelineError
-      }
-      return pipeline
-    }
-
-    def augmentedContext = [trigger: pipeline.trigger]
+    def augmentedContext = [
+      trigger: pipeline.trigger,
+      templateVariables: pipeline.templateVariables ?: [:]
+    ]
     def processedPipeline = contextParameterProcessor.process(pipeline, augmentedContext, false)
     processedPipeline.trigger = objectMapper.convertValue(processedPipeline.trigger, Trigger)
 
     if (pipelineError == null) {
-      startPipeline(processedPipeline)
+      def id = startPipeline(processedPipeline)
+      log.info("Started pipeline {} based on request body {}", id, request)
+      return [ref: "/pipelines/" + id]
     } else {
-      markPipelineFailed(processedPipeline, pipelineError)
+      def id = markPipelineFailed(processedPipeline, pipelineError)
+      log.info("Failed to start pipeline {} based on request body {}", id, request)
       throw pipelineError
     }
   }
 
-  private Map parseAndValidatePipeline(Map pipeline) {
-    parsePipelineTrigger(executionRepository, buildService, pipeline)
+  public Map parseAndValidatePipeline(Map pipeline) {
+    return parseAndValidatePipeline(pipeline, true)
+  }
+
+  public Map parseAndValidatePipeline(Map pipeline, boolean resolveArtifacts) {
+    parsePipelineTrigger(executionRepository, buildService, pipeline, resolveArtifacts)
 
     for (PipelinePreprocessor preprocessor : (pipelinePreprocessors ?: [])) {
       pipeline = preprocessor.process(pipeline)
     }
-
-    def json = objectMapper.writeValueAsString(pipeline)
-    log.info('received pipeline {}:{}', value("pipelineId", pipeline.id), json)
 
     if (pipeline.disabled) {
       throw new InvalidRequestException("Pipeline is disabled and cannot be started.")
@@ -132,7 +194,7 @@ class OperationsController {
 
     def linear = pipeline.stages.every { it.refId == null }
     if (linear) {
-      convertLinearToParallel(pipeline)
+      applyStageRefIds(pipeline)
     }
 
     if (pipeline.errors != null) {
@@ -141,7 +203,7 @@ class OperationsController {
     return pipeline
   }
 
-  private void parsePipelineTrigger(ExecutionRepository executionRepository, BuildService buildService, Map pipeline) {
+  private void parsePipelineTrigger(ExecutionRepository executionRepository, BuildService buildService, Map pipeline, boolean resolveArtifacts) {
     if (!(pipeline.trigger instanceof Map)) {
       pipeline.trigger = [:]
       if (pipeline.plan && pipeline.type == "templatedPipeline" && pipelineTemplateService != null) {
@@ -166,11 +228,17 @@ class OperationsController {
     }
 
     if (buildService) {
-      getBuildInfo(pipeline.trigger)
+      decorateBuildInfo(pipeline.trigger)
     }
 
     if (pipeline.trigger.parentPipelineId && !pipeline.trigger.parentExecution) {
-      def parentExecution = executionRepository.retrieve(PIPELINE, pipeline.trigger.parentPipelineId)
+      Execution parentExecution
+      try {
+        parentExecution = executionRepository.retrieve(PIPELINE, pipeline.trigger.parentPipelineId)
+      } catch (ExecutionNotFoundException e) {
+        // ignore
+      }
+
       if (parentExecution) {
         pipeline.trigger.isPipeline         = true
         pipeline.trigger.parentStatus       = parentExecution.status
@@ -191,33 +259,35 @@ class OperationsController {
       }
     }
 
-    if (!pipeline.plan) {
+    if (resolveArtifacts) {
       artifactResolver?.resolveArtifacts(pipeline)
     }
   }
 
-  private void getBuildInfo(Map trigger) {
+  private void decorateBuildInfo(Map trigger) {
     if (trigger.master && trigger.job && trigger.buildNumber) {
       def buildInfo = buildService.getBuild(trigger.buildNumber, trigger.master, trigger.job)
       if (buildInfo?.artifacts) {
-        if (!buildArtifactFilter) {
-          log.warn("Igor is not enabled, unable to lookup build artifacts. Fix this by setting igor.enabled: true")
-        } else {
-          buildInfo.artifacts = buildArtifactFilter.filterArtifacts(buildInfo.artifacts)
-          if (trigger.type == "manual") {
-            trigger.artifacts = buildInfo.artifacts
-          }
+        if (trigger.type == "manual") {
+          trigger.artifacts = buildInfo.artifacts
         }
-
       }
       trigger.buildInfo = buildInfo
       if (trigger.propertyFile) {
-        trigger.properties = buildService.getPropertyFile(
-          trigger.buildNumber as Integer,
-          trigger.propertyFile as String,
-          trigger.master as String,
-          trigger.job as String
-        )
+        try {
+          trigger.properties = buildService.getPropertyFile(
+            trigger.buildNumber as Integer,
+            trigger.propertyFile as String,
+            trigger.master as String,
+            trigger.job as String
+          )
+        } catch (RetrofitError e) {
+          if (e.response?.status == 404) {
+            throw new IllegalStateException("Expected properties file " + trigger.propertyFile + " (configured on trigger), but it was missing")
+          } else {
+            throw e
+          }
+        }
       }
     } else if (trigger?.registry && trigger?.repository && trigger?.tag) {
       trigger.buildInfo = [
@@ -229,14 +299,14 @@ class OperationsController {
   @RequestMapping(value = "/ops", method = RequestMethod.POST)
   Map<String, String> ops(@RequestBody List<Map> input) {
     def execution = [application: null, name: null, stages: input]
-    parsePipelineTrigger(executionRepository, buildService, execution)
+    parsePipelineTrigger(executionRepository, buildService, execution, true)
     startTask(execution)
   }
 
   @RequestMapping(value = "/ops", consumes = "application/context+json", method = RequestMethod.POST)
   Map<String, String> ops(@RequestBody Map input) {
     def execution = [application: input.application, name: input.description, stages: input.job, trigger: input.trigger ?: [:]]
-    parsePipelineTrigger(executionRepository, buildService, execution)
+    parsePipelineTrigger(executionRepository, buildService, execution, true)
     startTask(execution)
   }
 
@@ -262,11 +332,28 @@ class OperationsController {
         preconfiguredProperties: it.preconfiguredProperties,
         noUserConfigurableFields: it.noUserConfigurableFields(),
         parameters: it.parameters,
+        parameterData: it.parameterData,
       ]
     }
   }
 
-  private void convertLinearToParallel(Map<String, Serializable> pipelineConfig) {
+  @RequestMapping(value = "/jobs/preconfigured")
+  List<Map<String, Object>> preconfiguredJob() {
+    if (!jobService) {
+      return []
+    }
+    return jobService?.getPreconfiguredStages().collect{
+      [ label: it.label,
+        description: it.description,
+        type: it.type,
+        waitForCompletion: it.waitForCompletion,
+        noUserConfigurableFields: true,
+        parameters: it.parameters,
+      ]
+    }
+  }
+
+  private static void applyStageRefIds(Map<String, Serializable> pipelineConfig) {
     def stages = (List<Map<String, Object>>) pipelineConfig.stages
     stages.eachWithIndex { Map<String, Object> stage, int index ->
       stage.put("refId", String.valueOf(index))
@@ -278,30 +365,24 @@ class OperationsController {
     }
   }
 
-  private Map<String, String> startPipeline(Map config) {
+  private String startPipeline(Map config) {
     injectPipelineOrigin(config)
     def json = objectMapper.writeValueAsString(config)
-    log.info('requested pipeline: {}', json)
-
     def pipeline = executionLauncher.start(PIPELINE, json)
-
-    [ref: "/pipelines/${pipeline.id}".toString()]
+    return pipeline.id
   }
 
-  private Map<String, String> markPipelineFailed(Map config, Exception e) {
+  private String markPipelineFailed(Map config, Exception e) {
     injectPipelineOrigin(config)
     def json = objectMapper.writeValueAsString(config)
-    log.warn('requested pipeline marked as failed: {}', json)
-
     def pipeline = executionLauncher.fail(PIPELINE, json, e)
-
-    [ref: "/pipelines/${pipeline.id}".toString()]
+    return pipeline.id
   }
 
   private Map<String, String> startTask(Map config) {
     def linear = config.stages.every { it.refId == null }
     if (linear) {
-      convertLinearToParallel(config)
+      applyStageRefIds(config)
     }
     injectPipelineOrigin(config)
     def json = objectMapper.writeValueAsString(config)

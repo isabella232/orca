@@ -21,11 +21,11 @@ import com.netflix.spinnaker.fiat.model.resources.Account
 import com.netflix.spinnaker.fiat.model.resources.Role
 import com.netflix.spinnaker.fiat.shared.FiatService
 import com.netflix.spinnaker.fiat.shared.FiatStatus
+import com.netflix.spinnaker.orca.front50.Front50Service
 
 import javax.servlet.http.HttpServletResponse
 import com.netflix.spinnaker.kork.web.exceptions.InvalidRequestException
 import com.netflix.spinnaker.kork.web.exceptions.ValidationException
-import com.netflix.spinnaker.orca.igor.BuildArtifactFilter
 import com.netflix.spinnaker.orca.igor.BuildService
 import com.netflix.spinnaker.orca.jackson.OrcaObjectMapper
 import com.netflix.spinnaker.orca.pipeline.ExecutionLauncher
@@ -36,7 +36,7 @@ import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
 import com.netflix.spinnaker.orca.pipeline.util.ArtifactResolver
 import com.netflix.spinnaker.orca.pipeline.util.ContextParameterProcessor
 import com.netflix.spinnaker.orca.pipelinetemplate.PipelineTemplateService
-import com.netflix.spinnaker.orca.webhook.config.PreconfiguredWebhookProperties
+import com.netflix.spinnaker.orca.webhook.config.WebhookProperties
 import com.netflix.spinnaker.orca.webhook.service.WebhookService
 import com.netflix.spinnaker.security.AuthenticatedRequest
 import groovy.json.JsonSlurper
@@ -44,7 +44,6 @@ import org.apache.log4j.MDC
 import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
-import org.springframework.mock.env.MockEnvironment
 import org.springframework.test.web.servlet.setup.MockMvcBuilders
 import rx.Observable
 import spock.lang.Specification
@@ -75,15 +74,12 @@ class OperationsControllerSpec extends Specification {
   def fiatStatus = Mock(FiatStatus) {
     _ * isEnabled() >> { return false }
   }
-
-  def env = new MockEnvironment()
-  def buildArtifactFilter = new BuildArtifactFilter(environment: env)
+  def front50Service = Mock(Front50Service)
 
   @Subject
     controller = new OperationsController(
       objectMapper: mapper,
       buildService: buildService,
-      buildArtifactFilter: buildArtifactFilter,
       executionRepository: executionRepository,
       pipelineTemplateService: pipelineTemplateService,
       executionLauncher: executionLauncher,
@@ -91,7 +87,8 @@ class OperationsControllerSpec extends Specification {
       webhookService: webhookService,
       artifactResolver: artifactResolver,
       fiatService: fiatService,
-      fiatStatus: fiatStatus
+      fiatStatus: fiatStatus,
+      front50Service: front50Service
     )
 
   @Unroll
@@ -443,7 +440,7 @@ class OperationsControllerSpec extends Specification {
     startedPipeline.pipelineConfigId == 'from pipeline'
   }
 
-  def "an empty string does not get overriden with default values"() {
+  def "an empty string does not get overridden with default values"() {
     given:
     Execution startedPipeline = null
     executionLauncher.start(*_) >> { ExecutionType type, String json ->
@@ -490,7 +487,6 @@ class OperationsControllerSpec extends Specification {
     def tempController = new OperationsController(
         objectMapper: mapper,
         buildService: buildService,
-        buildArtifactFilter: buildArtifactFilter,
         executionRepository: executionRepository,
         pipelineTemplateService: pipelineTemplateService,
         executionLauncher: executionLauncher,
@@ -536,65 +532,6 @@ class OperationsControllerSpec extends Specification {
 
     then:
     startedPipeline.getTrigger().resolvedExpectedArtifacts[0].boundArtifact.reference == reference
-  }
-
-  @Unroll
-  def 'limits artifacts in buildInfo based on environment configuration'() {
-    given:
-    env.withProperty(BuildArtifactFilter.MAX_ARTIFACTS_PROP, maxArtifacts.toString())
-    env.withProperty(BuildArtifactFilter.PREFERRED_ARTIFACTS_PROP, preferredArtifacts)
-    Execution startedPipeline = null
-    executionLauncher.start(*_) >> { ExecutionType type, String json ->
-      startedPipeline = mapper.readValue(json, Execution)
-      startedPipeline.id = UUID.randomUUID().toString()
-      startedPipeline
-    }
-    buildService.getBuild(buildNumber, master, job) >> buildInfo
-
-    when:
-    controller.orchestrate(requestedPipeline, Mock(HttpServletResponse))
-
-    then:
-    with(startedPipeline) {
-      trigger.type == requestedPipeline.trigger.type
-      trigger instanceof JenkinsTrigger
-      trigger.master == master
-      trigger.job == job
-      trigger.buildNumber == buildNumber
-      trigger.buildInfo.artifacts.fileName == expectedArtifacts
-    }
-
-    where:
-    maxArtifacts | preferredArtifacts | expectedArtifacts
-    1            | 'deb'              | ['foo1.deb']
-    2            | 'deb'              | ['foo1.deb', 'foo2.rpm']
-    2            | 'deb,properties'   | ['foo1.deb', 'foo3.properties']
-    2            | 'properties,rpm'   | ['foo3.properties', 'foo2.rpm']
-    1            | 'nupkg'            | ['foo8.nupkg']
-
-
-    master = "master"
-    job = "job"
-    buildNumber = 1337
-    requestedPipeline = [
-      trigger: [
-        type       : "jenkins",
-        master     : master,
-        job        : job,
-        buildNumber: buildNumber,
-        user       : 'foo'
-      ]
-    ]
-    buildInfo = [name: job, number: buildNumber, url: "http://jenkins", result: "SUCCESS", artifacts: [
-      [fileName: 'foo1.deb', relativePath: "."],
-      [fileName: 'foo2.rpm', relativePath: "."],
-      [fileName: 'foo3.properties', relativePath: "."],
-      [fileName: 'foo4.yml', relativePath: "."],
-      [fileName: 'foo5.json', relativePath: "."],
-      [fileName: 'foo6.xml', relativePath: "."],
-      [fileName: 'foo7.txt', relativePath: "."],
-      [fileName: 'foo8.nupkg', relativePath: "."],
-    ]]
   }
 
   def "should not start pipeline when truthy plan pipeline attribute is present"() {
@@ -707,8 +644,8 @@ class OperationsControllerSpec extends Specification {
       createPreconfiguredWebhook("Webhook #2", "Description #2", "webhook_2", null)
     ]
     preconfiguredWebhooks == [
-      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null],
-      [label: "Webhook #2", description: "Description #2", type: "webhook_2", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null]
+      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null, parameterData: null],
+      [label: "Webhook #2", description: "Description #2", type: "webhook_2", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null, parameterData: null]
     ]
   }
 
@@ -741,7 +678,7 @@ class OperationsControllerSpec extends Specification {
       createPreconfiguredWebhook("Webhook #2", "Description #2", "webhook_2", ["READ": ["some-role"], "WRITE": ["some-role"]])
     ]
     preconfiguredWebhooks == [
-      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null]
+      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null, parameterData: null]
     ]
   }
 
@@ -774,20 +711,49 @@ class OperationsControllerSpec extends Specification {
       createPreconfiguredWebhook("Webhook #2", "Description #2", "webhook_2", ["READ": ["some-role"], "WRITE": ["some-role"]])
     ]
     preconfiguredWebhooks == [
-      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null],
-      [label: "Webhook #2", description: "Description #2", type: "webhook_2", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null]
+      [label: "Webhook #1", description: "Description #1", type: "webhook_1", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null, parameterData: null],
+      [label: "Webhook #2", description: "Description #2", type: "webhook_2", waitForCompletion: true, preconfiguredProperties: preconfiguredProperties, noUserConfigurableFields: true, parameters: null, parameterData: null]
     ]
   }
 
-  static PreconfiguredWebhookProperties.PreconfiguredWebhook createPreconfiguredWebhook(
+  def "should start pipeline by config id with provided trigger"() {
+    given:
+    Execution startedPipeline = null
+    executionLauncher.start(*_) >> { ExecutionType type, String json ->
+      startedPipeline = mapper.readValue(json, Execution)
+    }
+    front50Service.getPipelineHistory("1234", 1) >> {
+      [
+        [id: '1234', stages: []]
+      ]
+    }
+
+    Map trigger = [
+      type      : "manual",
+      parameters: [
+        key1: 'value1',
+        key2: 'value2'
+      ]
+    ]
+
+    when:
+    controller.orchestratePipelineConfig('1234', trigger)
+
+    then:
+    startedPipeline.id == '1234'
+    startedPipeline.trigger.type == 'manual'
+    startedPipeline.trigger.parameters.key1 == 'value1'
+  }
+
+  static WebhookProperties.PreconfiguredWebhook createPreconfiguredWebhook(
     def label, def description, def type, def permissions) {
     def customHeaders = new HttpHeaders()
     customHeaders.put("header", ["value1"])
-    return new PreconfiguredWebhookProperties.PreconfiguredWebhook(
+    return new WebhookProperties.PreconfiguredWebhook(
       label: label, description: description, type: type,
       url: "a", customHeaders: customHeaders, method: HttpMethod.POST, payload: "b",
-      waitForCompletion: true, statusUrlResolution: PreconfiguredWebhookProperties.StatusUrlResolution.webhookResponse,
-      statusUrlJsonPath: "c", statusJsonPath: "d", progressJsonPath: "e", successStatuses: "f", canceledStatuses: "g", terminalStatuses: "h", parameters: null,
+      waitForCompletion: true, statusUrlResolution: WebhookProperties.StatusUrlResolution.webhookResponse,
+      statusUrlJsonPath: "c", statusJsonPath: "d", progressJsonPath: "e", successStatuses: "f", canceledStatuses: "g", terminalStatuses: "h", parameters: null, parameterData: null,
       permissions: permissions
     )
   }

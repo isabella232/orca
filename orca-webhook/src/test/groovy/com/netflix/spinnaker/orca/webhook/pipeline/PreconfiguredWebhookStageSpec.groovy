@@ -20,7 +20,7 @@ package com.netflix.spinnaker.orca.webhook.pipeline
 import com.netflix.spinnaker.orca.pipeline.TaskNode
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
-import com.netflix.spinnaker.orca.webhook.config.PreconfiguredWebhookProperties
+import com.netflix.spinnaker.orca.webhook.config.WebhookProperties
 import com.netflix.spinnaker.orca.webhook.service.WebhookService
 import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpMethod
@@ -50,7 +50,7 @@ class PreconfiguredWebhookStageSpec extends Specification {
       method: HttpMethod.POST,
       payload: "b",
       waitForCompletion: true,
-      statusUrlResolution: PreconfiguredWebhookProperties.StatusUrlResolution.locationHeader,
+      statusUrlResolution: WebhookProperties.StatusUrlResolution.locationHeader,
       statusUrlJsonPath: "c",
       statusJsonPath: "d",
       progressJsonPath: "e",
@@ -58,6 +58,7 @@ class PreconfiguredWebhookStageSpec extends Specification {
       canceledStatuses: "g",
       terminalStatuses: "h",
       parameterValues: null,
+      parameterData: null,
       permissions: null
     ]
   }
@@ -70,7 +71,7 @@ class PreconfiguredWebhookStageSpec extends Specification {
       method: HttpMethod.POST,
       payload: "b",
       waitForCompletion: true,
-      statusUrlResolution: PreconfiguredWebhookProperties.StatusUrlResolution.webhookResponse,
+      statusUrlResolution: WebhookProperties.StatusUrlResolution.webhookResponse,
       statusUrlJsonPath: "c",
       statusJsonPath: "d",
       progressJsonPath: "e",
@@ -85,14 +86,14 @@ class PreconfiguredWebhookStageSpec extends Specification {
     preconfiguredWebhookStage.taskGraph(stage, builder)
 
     then:
-    1 * webhookService.preconfiguredWebhooks >> [new PreconfiguredWebhookProperties.PreconfiguredWebhook(label: "Webhook #1", description: "Description #1", type: "webhook_1")]
+    1 * webhookService.preconfiguredWebhooks >> [new WebhookProperties.PreconfiguredWebhook(label: "Webhook #1", description: "Description #1", type: "webhook_1")]
     stage.context == [
       url: "a",
       customHeaders: ["header": ["value1"]],
       method: HttpMethod.POST,
       payload: "b",
       waitForCompletion: true,
-      statusUrlResolution: PreconfiguredWebhookProperties.StatusUrlResolution.webhookResponse,
+      statusUrlResolution: WebhookProperties.StatusUrlResolution.webhookResponse,
       statusUrlJsonPath: "c",
       statusJsonPath: "d",
       progressJsonPath: "e",
@@ -100,16 +101,17 @@ class PreconfiguredWebhookStageSpec extends Specification {
       canceledStatuses: "g",
       terminalStatuses: "h",
       parameterValues: null,
+      parameterData: null,
       permissions: null
     ]
   }
 
-  static PreconfiguredWebhookProperties.PreconfiguredWebhook createPreconfiguredWebhook(def label, def description, def type) {
+  static WebhookProperties.PreconfiguredWebhook createPreconfiguredWebhook(def label, def description, def type) {
     def customHeaders = new HttpHeaders()
     customHeaders.add("header", "value1")
-    return new PreconfiguredWebhookProperties.PreconfiguredWebhook(
+    return new WebhookProperties.PreconfiguredWebhook(
       label: label, description: description, type: type, url: "a", customHeaders: customHeaders, method: HttpMethod.POST, payload: "b",
-      waitForCompletion: true, statusUrlResolution: PreconfiguredWebhookProperties.StatusUrlResolution.locationHeader,
+      waitForCompletion: true, statusUrlResolution: WebhookProperties.StatusUrlResolution.locationHeader,
       statusUrlJsonPath: "c", statusJsonPath: "d", progressJsonPath: "e", successStatuses: "f", canceledStatuses: "g", terminalStatuses: "h"
     )
   }

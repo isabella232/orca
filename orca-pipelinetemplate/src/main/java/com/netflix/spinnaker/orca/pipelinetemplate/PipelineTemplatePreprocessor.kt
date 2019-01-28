@@ -20,6 +20,7 @@ import com.netflix.spectator.api.BasicTag
 import com.netflix.spectator.api.Registry
 import com.netflix.spinnaker.orca.extensionpoint.pipeline.PipelinePreprocessor
 import com.netflix.spinnaker.orca.pipelinetemplate.handler.*
+import com.netflix.spinnaker.orca.pipelinetemplate.v2schema.model.V2PipelineTemplate
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Component
@@ -43,6 +44,20 @@ class PipelineTemplatePreprocessor
     if (pipeline == null) {
       return mutableMapOf()
     }
+
+    // TODO(jacobkiefer): We push the 'toplevel' v2 config into a 'config' field to play nice
+    // with MPT v1's opinionated TemplatedPipelineRequest. When we cut over, the template configuration
+    // should be lifted to the top level like users will specify them.
+    //
+    // We also need to ensure that 'type' and 'schema' are set properly upstream when saving v2 template configs.
+    if (pipeline.getOrDefault(V2PipelineTemplate.SCHEMA, null) == V2PipelineTemplate.V2_SCHEMA_VERSION &&
+      pipeline.get("template") != null) {
+      val templateConfig = HashMap(pipeline)
+      templateConfig.remove("trigger") // template configurations don't have a 'trigger' field.
+      pipeline.put("config", templateConfig)
+      pipeline.put("type", "templatedPipeline")
+    }
+
 
     val request = pipelineTemplateObjectMapper.convertValue(pipeline, TemplatedPipelineRequest::class.java)
     if (!request.isTemplatedPipelineRequest) {
