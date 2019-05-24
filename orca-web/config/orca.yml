@@ -46,7 +46,7 @@ tasks:
   useWaitForAllNetflixAWSInstancesDownTask: false
 
 logging:
-  config: classpath:logback-defaults.xml
+  config: classpath:logback-dd.xml
 
 # This configuration lets you configure Webhook stages that will appear as native stages in the Deck UI.
 # Properties that are set here will not be displayed in the GUI
